@@ -1,154 +1,269 @@
+import time
 import hashlib
-from time import sleep
+import json
+import requests
+import base64
+from flask import Flask, request
+from multiprocessing import Process, Pipe
+import ecdsa
+
+from miner_config import MINER_ADDRESS, MINER_NODE_URL, PEER_NODES
+
+node = Flask(__name__)
 
 
-def hash_256(string):
-    return hashlib.sha256(string.encode('utf-8')).hexdigest()
-
-
-class TransactionGenerator:
-    def __init__(self):
-        self.random_seed = 0
-
-    def generate_transaction(self):
-        transaction_payload = 'This is a transaction between A and B. ' \
-                              'We add a random seed here {} to make its hash unique'.format(self.random_seed)
-        transaction_hash = hash_256(transaction_payload)
-        self.random_seed += 1
-        return transaction_hash
-
-
-# a block is a set of transactions and contains information of the previous blocks.
-# https://bitcoin.stackexchange.com/questions/8031/what-are-bitcoin-miners-really-solving
 class Block:
-    def __init__(self, hash_prev_block, target):
-        self.transactions = []
-        self.hash_prev_block = hash_prev_block  # hash of the all previous blocks. used to maintain integrity.
-        self.hash_merkle_block = None
-        self.target = target
-        self.nounce = 0
+    def __init__(self, index, timestamp, data, previous_hash):
+        """Returns a new Block object. Each block is "chained" to its previous
+        by calling its unique hash.
 
-    def add_transaction(self, new_transac):
-        if not self.is_block_full():
-            self.transactions.append(new_transac)
-            self.hash_merkle_block = hash_256(str('-'.join(self.transactions)))
+        Args:
+            index (int): Block number.
+            timestamp (int): Block creation timestamp.
+            data (str): Data to be sent.
+            previous_hash(str): String representing previous block unique hash.
 
-    def is_block_full(self):
-        # blocks cannot go above 1Mb. Here let's say we cannot go above 1000 transactions.
-        return len(self.transactions) >= 1000
+        Attrib:
+            index (int): Block number.
+            timestamp (int): Block creation timestamp.
+            data (str): Data to be sent.
+            previous_hash(str): String representing previous block unique hash.
+            hash(str): Current block unique hash.
 
-    def is_block_ready_to_mine(self):
-        return self.is_block_full()
+        """
+        self.index = index
+        self.timestamp = timestamp
+        self.data = data
+        self.previous_hash = previous_hash
+        self.hash = self.hash_block()
 
-    def __str__(self):
-        return '-'.join([self.hash_merkle_block, str(self.nounce)])
+    def hash_block(self):
+        """Creates the unique hash for the block. It uses sha256."""
+        sha = hashlib.sha256()
+        sha.update((str(self.index) + str(self.timestamp) + str(self.data) + str(self.previous_hash)).encode('utf-8'))
+        return sha.hexdigest()
 
-    def apply_mining_step(self):
-        current_block_hash = hash_256(self.__str__())
-        print('CURRENT_BLOCK_HASH = {}, TARGET = {}'.format(current_block_hash, self.target))
-        if int(current_block_hash, 16) < int(self.target, 16):
-            print('Block was successfully mined! You will get a reward of x BTC!')
-            print('It took {} steps to mine it.'.format(self.nounce))
-            return True
+
+def create_genesis_block():
+    """To create each block, it needs the hash of the previous one. First
+    block has no previous, so it must be created manually (with index zero
+     and arbitrary previous hash)"""
+    return Block(0, time.time(), {
+        "proof-of-work": 9,
+        "transactions": None},
+        "0")
+
+
+# Node's blockchain copy
+BLOCKCHAIN = [create_genesis_block()]
+
+""" Stores the transactions that this node has in a list.
+If the node you sent the transaction adds a block
+it will get accepted, but there is a chance it gets
+discarded and your transaction goes back as if it was never
+processed"""
+NODE_PENDING_TRANSACTIONS = []
+
+
+def proof_of_work(last_proof, blockchain):
+    # Creates a variable that we will use to find our next proof of work
+    incrementer = last_proof + 1
+    # Keep incrementing the incrementer until it's equal to a number divisible by 7919
+    # and the proof of work of the previous block in the chain
+    start_time = time.time()
+    while not (incrementer % 7919 == 0 and incrementer % last_proof == 0):
+        incrementer += 1
+        # Check if any node found the solution every 60 seconds
+        if int((time.time()-start_time) % 60) == 0:
+            # If any other node got the proof, stop searching
+            new_blockchain = consensus(blockchain)
+            if new_blockchain:
+                # (False: another node got proof first, new blockchain)
+                return False, new_blockchain
+    # Once that number is found, we can return it as a proof of our work
+    return incrementer, blockchain
+
+
+def mine(a, blockchain, node_pending_transactions):
+    BLOCKCHAIN = blockchain
+    NODE_PENDING_TRANSACTIONS = node_pending_transactions
+    while True:
+        """Mining is the only way that new coins can be created.
+        In order to prevent too many coins to be created, the process
+        is slowed down by a proof of work algorithm.
+        """
+        # Get the last proof of work
+        last_block = BLOCKCHAIN[-1]
+        last_proof = last_block.data['proof-of-work']
+        # Find the proof of work for the current block being mined
+        # Note: The program will hang here until a new proof of work is found
+        proof = proof_of_work(last_proof, BLOCKCHAIN)
+        # If we didn't guess the proof, start mining again
+        if not proof[0]:
+            # Update blockchain and save it to file
+            BLOCKCHAIN = proof[1]
+            a.send(BLOCKCHAIN)
+            continue
         else:
-            # Incrementing the nounce to change current_block_hash to hope to be below the target.
-            self.nounce += 1
+            # Once we find a valid proof of work, we know we can mine a block so
+            # ...we reward the miner by adding a transaction
+            # First we load all pending transactions sent to the node server
+            NODE_PENDING_TRANSACTIONS = requests.get(url = MINER_NODE_URL + '/txion', params = {'update':MINER_ADDRESS}).content
+            NODE_PENDING_TRANSACTIONS = json.loads(NODE_PENDING_TRANSACTIONS)
+            # Then we add the mining reward
+            NODE_PENDING_TRANSACTIONS.append({
+                "from": "network",
+                "to": MINER_ADDRESS,
+                "amount": 1})
+            # Now we can gather the data needed to create the new block
+            new_block_data = {
+                "proof-of-work": proof[0],
+                "transactions": list(NODE_PENDING_TRANSACTIONS)
+            }
+            new_block_index = last_block.index + 1
+            new_block_timestamp = time.time()
+            last_block_hash = last_block.hash
+            # Empty transaction list
+            NODE_PENDING_TRANSACTIONS = []
+            # Now create the new block
+            mined_block = Block(new_block_index, new_block_timestamp, new_block_data, last_block_hash)
+            BLOCKCHAIN.append(mined_block)
+            # Let the client know this node mined a block
+            print(json.dumps({
+              "index": new_block_index,
+              "timestamp": str(new_block_timestamp),
+              "data": new_block_data,
+              "hash": last_block_hash
+            }, sort_keys=True) + "\n")
+            a.send(BLOCKCHAIN)
+            requests.get(url = MINER_NODE_URL + '/blocks', params = {'update':MINER_ADDRESS})
+
+def find_new_chains():
+    # Get the blockchains of every other node
+    other_chains = []
+    for node_url in PEER_NODES:
+        # Get their chains using a GET request
+        block = requests.get(url = node_url + "/blocks").content
+        # Convert the JSON object to a Python dictionary
+        block = json.loads(block)
+        # Verify other node block is correct
+        validated = validate_blockchain(block)
+        if validated:
+            # Add it to our list
+            other_chains.append(block)
+    return other_chains
+
+
+def consensus(blockchain):
+    # Get the blocks from other nodes
+    other_chains = find_new_chains()
+    # If our chain isn't longest, then we store the longest chain
+    BLOCKCHAIN = blockchain
+    longest_chain = BLOCKCHAIN
+    for chain in other_chains:
+        if len(longest_chain) < len(chain):
+            longest_chain = chain
+    # If the longest chain wasn't ours, then we set our chain to the longest
+    if longest_chain == BLOCKCHAIN:
+        # Keep searching for proof
+        return False
+    else:
+        # Give up searching proof, update chain and start over again
+        BLOCKCHAIN = longest_chain
+        return BLOCKCHAIN
+
+
+def validate_blockchain(block):
+    """Validate the submitted chain. If hashes are not correct, return false
+    block(str): json
+    """
+    return True
+
+
+@node.route('/blocks', methods=['GET'])
+def get_blocks():
+    # Load current blockchain. Only you should update your blockchain
+    if request.args.get("update") == MINER_ADDRESS:
+        global BLOCKCHAIN
+        BLOCKCHAIN = pipe_input.recv()
+    chain_to_send = BLOCKCHAIN
+    # Converts our blocks into dictionaries so we can send them as json objects later
+    chain_to_send_json = []
+    for block in chain_to_send:
+        block = {
+            "index": str(block.index),
+            "timestamp": str(block.timestamp),
+            "data": str(block.data),
+            "hash": block.hash
+        }
+        chain_to_send_json.append(block)
+
+    # Send our chain to whomever requested it
+    chain_to_send = json.dumps(chain_to_send_json, sort_keys=True)
+    return chain_to_send
+
+
+@node.route('/txion', methods=['GET', 'POST'])
+def transaction():
+    """Each transaction sent to this node gets validated and submitted.
+    Then it waits to be added to the blockchain. Transactions only move
+    coins, they don't create it.
+    """
+    if request.method == 'POST':
+        # On each new POST request, we extract the transaction data
+        new_txion = request.get_json()
+        # Then we add the transaction to our list
+        if validate_signature(new_txion['from'], new_txion['signature'], new_txion['message']):
+            NODE_PENDING_TRANSACTIONS.append(new_txion)
+            # Because the transaction was successfully
+            # submitted, we log it to our console
+            print("New transaction")
+            print("FROM: {0}".format(new_txion['from']))
+            print("TO: {0}".format(new_txion['to']))
+            print("AMOUNT: {0}\n".format(new_txion['amount']))
+            # Then we let the client know it worked out
+            return "Transaction submission successful\n"
+        else:
+            return "Transaction submission failed. Wrong signature\n"
+    # Send pending transactions to the mining process
+    elif request.method == 'GET' and request.args.get("update") == MINER_ADDRESS:
+        pending = json.dumps(NODE_PENDING_TRANSACTIONS, sort_keys=True)
+        # Empty transaction list
+        NODE_PENDING_TRANSACTIONS[:] = []
+        return pending
+
+
+def validate_signature(public_key, signature, message):
+    """Verifies if the signature is correct. This is used to prove
+    it's you (and not someone else) trying to do a transaction with your
+    address. Called when a user tries to submit a new transaction.
+    """
+    public_key = (base64.b64decode(public_key)).hex()
+    signature = base64.b64decode(signature)
+    vk = ecdsa.VerifyingKey.from_string(bytes.fromhex(public_key), curve=ecdsa.SECP256k1)
+    # Try changing into an if/else statement as except is too broad.
+    try:
+        return vk.verify(signature, message.encode())
+    except:
         return False
 
 
-class BlockChain:
-    def __init__(self):
-        self.block_chain = []
-
-    def push(self, block):
-        self.block_chain.append(block)
-
-    def notify_everybody(self):
-        print('-' * 80)
-        print('TO ALL THE NODES OF THE NETWORK, THIS BLOCK HAS BEEN ADDED:')
-        print('[block #{}] : {}'.format(len(self.block_chain), self.get_last_block()))
-        print('-' * 80)
-
-    def get_last_block(self):
-        return self.block_chain[-1]
-
-
-def my_first_miner():
-    last_block_header = '0e0fb2e3ae9bd2a0fa8b6999bfe6ab7df197a494d4a02885783a697ac74940d9'
-    last_block_target = '000ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
-
-    # init the block chains
-    block_chain = BlockChain()
-
-    transaction_generator = TransactionGenerator()
-
-    # fills a block with transactions. We have 1500 pending transactions.
-    # Sorry 500 transactions will have to wait for the next block!
-    block = Block(last_block_header, last_block_target)
-    for i in range(1500):
-        block.add_transaction(transaction_generator.generate_transaction())
-
-    assert block.is_block_full()
-    assert block.is_block_ready_to_mine()
-
-    # now that our block is full, we can start to mine it.
-    while not block.apply_mining_step():
-        continue
-
-    block_chain.push(block)
-    block_chain.notify_everybody()
-    sleep(5)
-
-    # Difficulty is updated every 2016 blocks.
-    # Objective is one block generated every 10 minutes.
-    # If during the last two weeks, blocks are generated every 5 minutes, then difficulty is multiplied by 2.
-    last_block_header = hash_256(str(block_chain.get_last_block()))
-
-    block_2 = Block(last_block_header, last_block_target)
-
-    for i in range(1232):
-        block_2.add_transaction(transaction_generator.generate_transaction())
-
-    assert block_2.is_block_full()
-    assert block_2.is_block_ready_to_mine()
-
-    # now that our block is full, we can start to mine it.
-    while not block_2.apply_mining_step():
-        continue
-
-    block_chain.push(block_2)
-    block_chain.notify_everybody()
-    sleep(5)
-
-    # now let's increase the difficulty.
-    # we have now 4 zeros at the beginning instead of 3.
-    last_block_target = '0000dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
-
-    last_block_header = hash_256(str(block_chain.get_last_block()))
-
-    block_3 = Block(last_block_header, last_block_target)
-
-    for i in range(1876):
-        block_3.add_transaction(transaction_generator.generate_transaction())
-
-    assert block_3.is_block_full()
-    assert block_3.is_block_ready_to_mine()
-
-    # now that our block is full, we can start to mine it.
-    while not block_3.apply_mining_step():
-        continue
-
-    block_chain.push(block_3)
-    block_chain.notify_everybody()
-    sleep(5)
-
-    print('')
-    print('SUMMARY')
-    print('')
-    for i, block_added in enumerate(block_chain.block_chain):
-        print('Block #{} was added. It took {} steps to find it.'.format(i, block_added.nounce))
-    print('Difficulty was increased for the last block!')
+def welcome_msg():
+    print("""       =========================================\n
+        SIMPLE COIN v1.0.0 - BLOCKCHAIN SYSTEM\n
+       =========================================\n\n
+        You can find more help at: https://github.com/cosme12/SimpleCoin\n
+        Make sure you are using the latest version or you may end in
+        a parallel chain.\n\n\n""")
 
 
 if __name__ == '__main__':
-    my_first_miner()
+    welcome_msg()
+    # Start mining
+    pipe_output, pipe_input = Pipe()
+    miner_process = Process(target=mine, args=(pipe_output, BLOCKCHAIN, NODE_PENDING_TRANSACTIONS))
+    miner_process.start()
+
+    # Start server to receive transactions
+    transactions_process = Process(target=node.run(), args=pipe_input)
+    transactions_process.start()
